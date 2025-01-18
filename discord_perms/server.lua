@@ -1,94 +1,113 @@
-local FormattedToken = "Bot "..Config.DiscordToken
+-- CREDITS https://github.com/logan-mcgee/discord_perms
 
-function DiscordRequest(method, endpoint, jsondata)
-    local data = nil
-    PerformHttpRequest("https://discordapp.com/api/"..endpoint, function(errorCode, resultData, resultHeaders)
-		data = {data=resultData, code=errorCode, headers=resultHeaders}
-    end, method, #jsondata > 0 and json.encode(jsondata) or "", {["Content-Type"] = "application/json", ["Authorization"] = FormattedToken})
+-- REWORKED BY @silkiauskas, Cache system, error handling, code structure, better performance
 
-    while data == nil do
-        Citizen.Wait(0)
+local Config = Config or {}
+local FormattedToken = "Bot " .. Config.DiscordToken
+local cachedMembers = {}
+local CACHE_DURATION = 300
+
+local DiscordRequest = function(method, endpoint, payload)
+    local response = promise.new()
+
+    PerformHttpRequest("https://discordapp.com/api/" .. endpoint, function(statusCode, resultData, resultHeaders)
+        response:resolve({
+            data = resultData and json.decode(resultData) or {},
+            code = statusCode,
+            headers = resultHeaders
+        })
+    end, method, payload and json.encode(payload) or "", {
+        ["Content-Type"] = "application/json",
+        ["Authorization"] = FormattedToken
+    })
+
+    return Citizen.Await(response)
+end
+
+local GetDiscordId = function(source)
+    for _, id in pairs(GetPlayerIdentifiers(source)) do
+        if id:match("^discord:") then
+            return id:gsub("discord:", "")
+        end
     end
-	
-    return data
+    return nil
 end
 
-function GetRoles(user)
-	local discordId = nil
-	for _, id in ipairs(GetPlayerIdentifiers(user)) do
-		if string.match(id, "discord:") then
-			discordId = string.gsub(id, "discord:", "")
-			print("Found discord id: "..discordId)
-			break
-		end
-	end
-
-	if discordId then
-		local endpoint = ("guilds/%s/members/%s"):format(Config.GuildId, discordId)
-		local member = DiscordRequest("GET", endpoint, {})
-		if member.code == 200 then
-			local data = json.decode(member.data)
-			local roles = data.roles
-			local found = true
-			return roles
-		else
-			print("An error occured, maybe they arent in the discord? Error: "..member.data)
-			return false
-		end
-	else
-		print("missing identifier")
-		return false
-	end
+local SetCachedMember = function(discordId, memberData)
+    cachedMembers[discordId] = {
+        data = memberData,
+        timestamp = os.time()
+    }
 end
 
-function IsRolePresent(user, role)
-	local discordId = nil
-	for _, id in ipairs(GetPlayerIdentifiers(user)) do
-		if string.match(id, "discord:") then
-			discordId = string.gsub(id, "discord:", "")
-			print("Found discord id: "..discordId)
-			break
-		end
-	end
-
-	local theRole = nil
-	if type(role) == "number" then
-		theRole = tostring(role)
-	else
-		theRole = Config.Roles[role]
-	end
-
-	if discordId then
-		local endpoint = ("guilds/%s/members/%s"):format(Config.GuildId, discordId)
-		local member = DiscordRequest("GET", endpoint, {})
-		if member.code == 200 then
-			local data = json.decode(member.data)
-			local roles = data.roles
-			local found = true
-			for i=1, #roles do
-				if roles[i] == theRole then
-					print("Found role")
-					return true
-				end
-			end
-			print("Not found!")
-			return false
-		else
-			print("An error occured, maybe they arent in the discord? Error: "..member.data)
-			return false
-		end
-	else
-		print("missing identifier")
-		return false
-	end
+local GetCachedMember = function(discordId)
+    local cached = cachedMembers[discordId]
+    if cached and (os.time() - cached.timestamp) < CACHE_DURATION then
+        return cached.data
+    end
+    return nil
 end
 
-Citizen.CreateThread(function()
-	local guild = DiscordRequest("GET", "guilds/"..Config.GuildId, {})
-	if guild.code == 200 then
-		local data = json.decode(guild.data)
-		print("Permission system guild set to: "..data.name.." ("..data.id..")")
-	else
-		print("An error occured, please check your config and ensure everything is correct. Error: "..(guild.data or guild.code)) 
-	end
+local GetMemberData = function(source)
+    local discordId = GetDiscordId(source)
+    if not discordId then
+        return false, "Missing Discord identifier"
+    end
+
+    local cached = GetCachedMember(discordId)
+    if cached then
+        return true, cached
+    end
+
+    local endpoint = ("guilds/%s/members/%s"):format(Config.GuildId, discordId)
+    local response = DiscordRequest("GET", endpoint, nil)
+
+    if response.code == 200 and response.data then
+        SetCachedMember(discordId, response.data)
+        return true, response.data
+    end
+
+    return false, "Failed to fetch member data: " .. (response.data.message or "Unknown error")
+end
+
+GetRoles = function(source)
+    local success, result = GetMemberData(source)
+    if success then
+        return result.roles
+    end
+    print("Error getting roles:", result)
+    return false
+end
+
+IsRolePresent = function(source, role)
+    local roleId = type(role) == "number" and tostring(role) or Config.Roles[role]
+    if not roleId then
+        return false, "Invalid role specified"
+    end
+
+    local success, memberData = GetMemberData(source)
+    if not success then
+        return false, memberData
+    end
+
+    for _, userRole in pairs(memberData.roles) do
+        if userRole == roleId then
+            return true
+        end
+    end
+
+    return false
+end
+
+CreateThread(function()
+    local response = DiscordRequest("GET", "guilds/" .. Config.GuildId, nil)
+    if response.code == 200 then
+        local guild = response.data
+        print(string.format("Permission system initialized for guild: %s (%s)", guild.name, guild.id))
+    else
+        print("Failed to initialize permission system:", response.data.message or "Unknown error")
+    end
 end)
+
+exports('GetRoles', GetRoles)
+exports('IsRolePresent', IsRolePresent)
