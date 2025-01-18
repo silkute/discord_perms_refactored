@@ -45,7 +45,7 @@ end
 -- Get all roles for a player
 local roles = exports.discord_roles:GetRoles(source)
 if roles then
-    for _, roleId in ipairs(roles) do
+    for _, roleId in pairs(roles) do
         -- Process roles
     end
 end
